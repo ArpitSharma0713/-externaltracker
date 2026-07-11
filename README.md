@@ -1,228 +1,80 @@
 # Provio Dark-Social Ingestion Engine (DSIE)
 
-This repository contains the current implementation of Provio's Dark-Social Ingestion Engine, a pipeline for collecting job posts from community channels and moving validated jobs into PostgreSQL.
+Provio DSIE collects job posts from dark-social communities, filters them for India-only fresher/entry-level technology roles, and moves validated jobs into PostgreSQL through a queue-based ingestion pipeline.
 
-The product goal from the DOC is to scale job ingestion from a few hundred jobs to 20,000+ jobs by listening to Telegram, WhatsApp, and Discord communities, buffering raw messages safely in Redis, filtering them through an OpenClaw-style AI decision layer, and inserting only clean India fresher tech jobs into the Provio database.
+The goal is to scale job ingestion beyond traditional scrapers by listening to Telegram, WhatsApp, and Discord communities where HRs, founders, and community managers post unlisted opportunities.
+
+## Current Status
+
+DSIE now has the full MVP pipeline shape:
+
+```txt
+Telegram / WhatsApp / Discord
+-> Redis raw queue
+-> rules-first Stage 3 extraction worker
+-> OpenRouter free-model fallback for uncertain messages
+-> deterministic policy validation
+-> Redis clean staging queue
+-> Go ingestion worker
+-> PostgreSQL social_jobs
+```
+
+The Stage 3 worker is no longer a placeholder. It now performs deterministic extraction first and uses free AI only as a fallback for uncertain posts.
 
 ## Architecture
 
-The intended system is split into four stages:
+### Stage 1: Social Listeners
 
-1. Stage 1: Social listeners
-   Telegram, WhatsApp, and Discord workers capture raw chat messages and push them into Redis.
+Listener workers capture raw messages and push them into Redis. They do not perform heavy processing.
 
-2. Stage 2: Redis buffer
-   Redis decouples noisy chat traffic from slower downstream AI and database processing.
-
-3. Stage 3: OpenClaw AI agent layer
-   The AI layer should classify raw messages, enforce business filters, normalize job fields, and push validated jobs into a clean staging queue.
-
-4. Stage 4: Go ingestion funnel
-   The Go worker consumes validated jobs from Redis and inserts them into PostgreSQL in controlled batches.
-
-Current queue contract:
-
-```txt
-provio_raw_messages_queue       # raw Telegram/WhatsApp/Discord messages
-provio_clean_jobs_staging       # AI-approved normalized jobs
-```
-
-## Repository Layout
-
-```txt
-externaltracker-python/
-|-- app/
-|-- ingest/
-|   |-- go.mod
-|   |-- go.sum
-|   `-- go_ingest.go
-|-- workers/
-|   |-- tg_worker.py
-|   |-- openclaw_worker.py
-|   |-- discord_worker.js
-|   |-- discord_shard.js
-|   `-- wa_worker.js
-|-- package.json
-|-- package-lock.json
-`-- requirements.txt
-```
-
-Sensitive local files are intentionally ignored:
-
-```txt
-.env
-node_modules/
-wa_session/
-*.session
-__pycache__/
-```
-
-## What Is Done
-
-### Project Foundation
-
-The project structure has been created and pushed to GitHub. Python, Node.js, Go, Redis, and PostgreSQL pieces are now represented in the repo.
-
-Completed:
-
-- Base `externaltracker-python` folder structure
-- Worker entrypoints for Telegram, Discord, WhatsApp, and OpenClaw
-- Go ingestion module under `ingest`
-- `.gitignore` covering secrets, local sessions, dependency folders, caches, and build artifacts
-- GitHub remote push completed for the initial working code
-
-### Stage 1: Telegram Listener
-
-Implemented in:
-
-```txt
-externaltracker-python/workers/tg_worker.py
-```
-
-Current capabilities:
-
-- Uses Telethon for Telegram MTProto listening
-- Loads settings from `.env`
-- Connects to Redis
-- Pushes raw payloads into `provio_raw_messages_queue`
-- Captures source, channel, message ID, raw text, timestamp, and media URL placeholder
-- Supports `TG_TARGET_CHANNELS`
-- Includes a public preview fallback mode for public Telegram channels
-- Handles first-time Telegram login and saved Telethon sessions
-
-Verified:
-
-- Dependencies installed in the active Python virtual environment
-- Telegram login succeeded
-- Worker reached `Connected to Telegram`
-- Redis connectivity worked
-
-Still pending:
-
-- Confirming at least one live Telegram message enters `provio_raw_messages_queue`
-- Production-grade reconnect/backoff handling
-- Cleaner operational logs and metrics
-- Media extraction beyond URL placeholders
-
-### Stage 1: Discord Listener
-
-Implemented in:
-
-```txt
-externaltracker-python/workers/discord_worker.js
-externaltracker-python/workers/discord_shard.js
-```
-
-Current capabilities:
-
-- Uses `discord.js`
-- Uses `ShardingManager`
-- Uses `GatewayIntentBits`
-- Connects to Redis
-- Pushes raw Discord messages into `provio_raw_messages_queue`
-- Supports optional `DISCORD_TARGET_CHANNEL_IDS`
-- Captures message text, channel, guild, message ID, timestamp, and attachment URLs
-- Ignores bot messages
-
-Verified:
-
-- Node dependencies installed
-- JavaScript syntax checks passed
-- Redis connection failure handling was improved
-- Worker now exits cleanly if Redis is unavailable instead of repeating errors endlessly
-
-Still pending:
-
-- Discord bot token must be valid in local `.env`
-- Message Content Intent must be enabled in Discord Developer Portal
-- Bot must be invited to a test server
-- Live message capture into Redis still needs end-to-end verification
-
-### Stage 1: WhatsApp Listener
-
-Implemented in:
-
-```txt
-externaltracker-python/workers/wa_worker.js
-```
-
-Current capabilities:
-
-- Uses `@whiskeysockets/baileys`
-- Shows QR code through `qrcode-terminal`
-- Uses multi-file WhatsApp auth state in `wa_session`
-- Connects to Redis
-- Pushes raw WhatsApp messages into `provio_raw_messages_queue`
-- Captures chat JID, message ID, raw text, timestamp, and media URL placeholder
-- Ignores messages sent by the connected account
-- Filters non-live history sync batches
-- Silences noisy Baileys internal logs
-
-Verified:
-
-- WhatsApp QR pairing succeeded
-- Worker reached `Connected and listening`
-- Redis connectivity worked
-
-Still pending:
-
-- Confirming at least one fresh live WhatsApp message enters `provio_raw_messages_queue`
-- More complete extraction for group names, sender IDs, and media
-- Session reset documentation for `wa_session`
-- Production reconnect/backoff strategy
+| Source | Worker | Runtime | Queue output |
+| --- | --- | --- | --- |
+| Telegram | `externaltracker-python/workers/tg_worker.py` | Python / Telethon | `provio_raw_messages_queue` |
+| WhatsApp | `externaltracker-python/workers/wa_worker.js` | Node.js / Baileys | `provio_raw_messages_queue` |
+| Discord | `externaltracker-python/workers/discord_worker.js` + `discord_shard.js` | Node.js / discord.js | `provio_raw_messages_queue` |
 
 ### Stage 2: Redis Buffer
 
-Redis queue contract is implemented across workers.
+Redis decouples noisy chat traffic from slower AI/database processing.
 
-Completed:
+| Queue | Purpose |
+| --- | --- |
+| `provio_raw_messages_queue` | Raw messages from Telegram, WhatsApp, and Discord |
+| `provio_clean_jobs_staging` | Validated jobs ready for Go ingestion |
+| `provio_jobs_review` | Uncertain or AI-failed messages for manual review |
+| `provio_jobs_dead_letter` | Malformed messages or unrecoverable parsing failures |
 
-- Raw listener queue: `provio_raw_messages_queue`
-- Clean job queue: `provio_clean_jobs_staging`
-- Docker Redis container `provio-redis` was used during development
-- `PING` returned `PONG`
-- `LLEN` checks worked for both queues
+### Stage 3: Rules-First Extraction Worker
 
-Still pending:
-
-- Redis persistence/backup policy
-- Dead-letter queue for malformed messages
-- Retry queue for transient AI/database failures
-- Monitoring for queue depth and worker lag
-
-### Stage 3: OpenClaw AI Agent Layer
-
-Placeholder file:
+Implemented in:
 
 ```txt
 externaltracker-python/workers/openclaw_worker.py
 ```
 
-Current state:
+This worker replaces the earlier OpenClaw placeholder with a bounded extraction engine:
 
-- The file exists and records the intended Stage 3 boundary.
-- The actual AI extraction/filtering loop is not implemented yet.
+- Consumes raw messages from `provio_raw_messages_queue`.
+- Applies regex/rule checks first.
+- Extracts URLs, emails, phones, experience ranges, location signals, seniority signals, and tech-track signals.
+- Accepts clear valid jobs without AI.
+- Rejects clear invalid jobs without AI.
+- Calls OpenRouter only for uncertain messages.
+- Allows only free OpenRouter models: `openrouter/free` or model IDs ending in `:free`.
+- Applies Redis-backed OpenRouter daily and per-minute limits.
+- Validates final policy in Python, not in the model.
+- Signs clean job envelopes with HMAC when `PROVIO_INGEST_HMAC_SECRET` is configured.
+- Routes uncertain/failing cases to `provio_jobs_review`.
 
-What the DOC expects here:
+Final acceptance policy:
 
-- Consume raw messages from `provio_raw_messages_queue`
-- Detect whether a post is a real job
-- Enforce India-only jobs
-- Enforce fresher, intern, trainee, entry-level, or 0-2 years seniority
-- Enforce tech tracks: `software`, `ai`, `data_science`
-- Normalize jobs into a clean JSON schema
-- Optionally sign jobs with HMAC
-- Push approved jobs to `provio_clean_jobs_staging`
-- Drop everything else
-
-Still pending:
-
-- Full OpenClaw worker implementation
-- LLM provider integration
-- Structured output validation
-- HMAC signing for production mode
-- Scam/ad/duplicate filtering
-- Unit tests for decision rules
+```txt
+country_code == IN
+seniority == fresher_intern
+tech_track in software, ai, data_science
+application URL/email/phone exists
+no blocking risk flags
+```
 
 ### Stage 4: Go Ingestion Funnel
 
@@ -232,59 +84,200 @@ Implemented in:
 externaltracker-python/ingest/go_ingest.go
 ```
 
-Current capabilities:
+The Go worker consumes clean jobs from `provio_clean_jobs_staging`, verifies signed envelopes when required, and inserts into PostgreSQL using `ON CONFLICT (job_source_url) DO NOTHING`.
 
-- Uses `github.com/redis/go-redis/v9`
-- Uses `github.com/jackc/pgx/v5`
-- Loads `../.env` when run from the `ingest` folder
-- Connects to Redis
-- Connects to PostgreSQL through `DATABASE_URL`
-- Blocks on `provio_clean_jobs_staging`
-- Parses direct clean job JSON or signed envelopes
-- Supports local unsigned jobs with `ALLOW_UNSIGNED_LOCAL_JOBS=true`
-- Verifies HMAC signatures when unsigned local jobs are disabled
-- Inserts into PostgreSQL table `social_jobs`
-- Uses `ON CONFLICT (job_source_url) DO NOTHING`
-- Rebuffers failed batches on database failure
-
-Verified:
-
-- `go mod tidy`
-- `go test -buildvcs=false .`
-- Redis connection
-- PostgreSQL connection
-- Manual clean job consumed from Redis
-- Real row inserted into `social_jobs`
-- PostgreSQL query showed inserted rows
-
-Example verified rows:
+## Repository Layout
 
 ```txt
-Software Engineer Intern | Provio Test Company | software     | manual_test
-Data Science Intern      | Provio Social Test  | data_science | manual_clean_test
+.
+|-- README.md
+`-- externaltracker-python/
+    |-- ingest/
+    |   |-- go.mod
+    |   |-- go.sum
+    |   `-- go_ingest.go
+    |-- workers/
+    |   |-- tg_worker.py
+    |   |-- wa_worker.js
+    |   |-- discord_worker.js
+    |   |-- discord_shard.js
+    |   `-- openclaw_worker.py
+    |-- package.json
+    |-- package-lock.json
+    `-- requirements.txt
 ```
 
-Still pending:
+Ignored local files include `.env`, `node_modules/`, `wa_session/`, Telegram session files, Python caches, virtual environments, and local Codex dependency folders.
 
-- Production batch size should move from `1` to `50`
-- Better transaction logging around inserted vs ignored row count
-- Migration file for `social_jobs`
-- Integration with the real production jobs schema
-- Tests around HMAC, malformed JSON, duplicate URLs, and rebuffering
-- Graceful shutdown and signal handling
+## Prerequisites
 
-### PostgreSQL
+- Python 3.11+
+- Node.js 18+
+- Go 1.22+
+- Redis
+- PostgreSQL
+- Optional: Docker for local Redis
+- OpenRouter account and API key if AI fallback is enabled
 
-Completed:
+## Local Setup
 
-- Local PostgreSQL connectivity verified
-- `tracker_db` database used
-- `social_jobs` table created or confirmed
-- `job_source_url` unique constraint verified
-- Manual insert tested
-- Go ingestion insert tested
+Run commands from:
 
-Current table shape:
+```powershell
+cd "C:\Users\avihs\Desktop\Work 5\DSIE\externaltracker-python"
+```
+
+Install Python dependencies:
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+Install Node dependencies:
+
+```powershell
+npm install
+```
+
+Prepare Go dependencies:
+
+```powershell
+cd "C:\Users\avihs\Desktop\Work 5\DSIE\externaltracker-python\ingest"
+go mod tidy
+go test -buildvcs=false .
+```
+
+## Environment Variables
+
+Create `externaltracker-python/.env`. Do not commit it.
+
+```env
+# Redis
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+REDIS_URL=redis://localhost:6379/0
+
+PROVIO_RAW_MESSAGES_QUEUE=provio_raw_messages_queue
+PROVIO_CLEAN_JOBS_QUEUE=provio_clean_jobs_staging
+PROVIO_REVIEW_QUEUE=provio_jobs_review
+PROVIO_DEAD_LETTER_QUEUE=provio_jobs_dead_letter
+
+# Telegram
+TG_API_ID=
+TG_API_HASH=
+TG_SESSION_NAME=provio_tg_session
+TG_PHONE_NUMBER=
+TG_TARGET_CHANNELS=@india_tech_jobs,@fresher_openings_india,@dev_jobs_hub
+TG_PUBLIC_PREVIEW_CHANNELS=india_tech_jobs,fresher_openings_india,dev_jobs_hub
+TG_WORKER_MODE=telethon
+PUBLIC_PREVIEW_POLL_SECONDS=60
+
+# Discord
+DISCORD_BOT_TOKEN=
+DISCORD_TARGET_CHANNEL_IDS=
+
+# WhatsApp
+WHATSAPP_SESSION_PATH=./wa_session
+
+# Stage 3 extraction
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=
+OPENROUTER_MODEL=openrouter/free
+OPENROUTER_DAILY_LIMIT=300
+OPENROUTER_PER_MINUTE_LIMIT=10
+AI_ONLY_FOR_UNCERTAIN=true
+AI_MAX_TOKENS=500
+OPENROUTER_TIMEOUT_SECONDS=20
+
+# Go ingestion / PostgreSQL
+DATABASE_URL=postgres://postgres:<password>@127.0.0.1:5432/tracker_db
+PROVIO_INGEST_HMAC_SECRET=change_this_secret
+SIGN_CLEAN_JOBS=true
+ALLOW_UNSIGNED_LOCAL_JOBS=true
+GO_INGEST_BATCH_SIZE=1
+```
+
+Recommended production changes:
+
+```env
+ALLOW_UNSIGNED_LOCAL_JOBS=false
+GO_INGEST_BATCH_SIZE=50
+SIGN_CLEAN_JOBS=true
+```
+
+## Running the Pipeline
+
+Start Redis:
+
+```powershell
+docker start provio-redis
+docker exec provio-redis redis-cli ping
+```
+
+Expected:
+
+```txt
+PONG
+```
+
+Start the Stage 3 extraction worker:
+
+```powershell
+cd "C:\Users\avihs\Desktop\Work 5\DSIE\externaltracker-python"
+python workers\openclaw_worker.py
+```
+
+Run listeners as needed:
+
+```powershell
+python workers\tg_worker.py
+node workers\discord_worker.js
+node workers\wa_worker.js
+```
+
+Run Go ingestion:
+
+```powershell
+cd "C:\Users\avihs\Desktop\Work 5\DSIE\externaltracker-python\ingest"
+go run -buildvcs=false go_ingest.go
+```
+
+## Manual Stage 3 Test
+
+Push a raw message into Redis:
+
+```powershell
+docker exec provio-redis redis-cli RPUSH provio_raw_messages_queue "{`"source`":`"manual_test`",`"channel`":`"local`",`"message_id`":`"test-001`",`"raw_text`":`"Hiring Software Engineer Intern at Provio. Freshers 0-1 years. Location: Remote India. Apply: https://example.com/apply`",`"timestamp`":`"2026-07-10T10:00:00Z`"}"
+```
+
+Expected worker output:
+
+```txt
+[OPENCLAW-MATCH] Software Engineer Intern @ Provio track=software method=rules
+```
+
+Check clean queue:
+
+```powershell
+docker exec provio-redis redis-cli LLEN provio_clean_jobs_staging
+docker exec provio-redis redis-cli LINDEX provio_clean_jobs_staging 0
+```
+
+Check review queue:
+
+```powershell
+docker exec provio-redis redis-cli LLEN provio_jobs_review
+```
+
+Check dead-letter queue:
+
+```powershell
+docker exec provio-redis redis-cli LLEN provio_jobs_dead_letter
+```
+
+## PostgreSQL Table
+
+The current local target table is:
 
 ```sql
 social_jobs (
@@ -301,305 +294,88 @@ social_jobs (
 )
 ```
 
-Still pending:
-
-- Add SQL migration files to the repo
-- Avoid relying on manually created local DB state
-- Add indexes for common query paths
-- Decide whether `company_slug` should be a slug or display company name
-- Map this staging table into the main production job listings model
-
-## How Much Is Complete
-
-High-level status:
-
-```txt
-Project scaffold:                 Done
-Redis queue contract:             Done
-Telegram worker implementation:   Mostly done, live capture verification pending
-Discord worker implementation:    Code done, bot/live capture verification pending
-WhatsApp worker implementation:   Mostly done, live capture verification pending
-OpenClaw AI worker:               Not implemented yet
-Go ingestion skeleton:            Done
-PostgreSQL insert path:           Done for local social_jobs table
-End-to-end raw-to-clean pipeline: Not done until OpenClaw exists
-Production readiness:             Not yet
-```
-
-Practical completion estimate:
-
-```txt
-Infrastructure and queue plumbing: 70-80%
-Listener code:                     60-70%
-AI validation layer:               0-10%
-Database ingestion:                70-80%
-Overall DSIE MVP:                  45-55%
-Production DSIE:                   20-30%
-```
-
-The project now has working foundations from source listeners through Redis and into PostgreSQL, but the critical missing bridge is Stage 3: the OpenClaw decision engine. Without Stage 3, raw Telegram/WhatsApp/Discord messages do not automatically become validated clean jobs.
-
-## Local Setup
-
-### Python
-
-From the project folder:
+Useful verification query:
 
 ```powershell
-cd "C:\Users\avihs\Desktop\Work 5\DSIE\externaltracker-python"
-python -m pip install -r requirements.txt
+& "C:\Program Files\PostgreSQL\18\bin\psql.exe" -U postgres -d tracker_db -c "SELECT id, title, company_slug, job_source_url, tech_track, source FROM social_jobs ORDER BY id DESC LIMIT 10;"
 ```
 
-Python dependencies:
+## Verified So Far
 
-```txt
-redis
-telethon
-python-dotenv
-requests
-beautifulsoup4
-```
+- Python syntax check passes for `openclaw_worker.py`.
+- Rules path accepts a clear India fresher software job.
+- Rules path rejects a senior non-India job.
+- In-memory queue test pushes a signed envelope to `provio_clean_jobs_staging`.
+- OpenRouter API is reachable with the configured key.
+- `openrouter/free` can return inconsistent JSON or loose enum labels, so the worker includes fallback parsing, alias normalization, and review routing.
+- Go ingestion has previously inserted clean manual jobs into local PostgreSQL.
 
-### Node.js
+## Production Readiness
+
+Production-friendly pieces already present:
+
+- Queue-based isolation between listeners, extraction, and database ingestion.
+- Rules-first extraction to reduce AI usage and cost.
+- Free-model enforcement for OpenRouter.
+- Redis-backed OpenRouter request limits.
+- Deterministic final policy gate in Python.
+- HMAC signing between extraction and Go ingestion.
+- Review and dead-letter queues.
+- Duplicate URL protection through PostgreSQL conflict handling.
+
+Remaining work before production:
+
+- Add SQL migration files for `social_jobs`.
+- Add unit tests for extraction rules, OpenRouter validation, HMAC envelopes, and Go parsing.
+- Run full live listener-to-DB tests for Telegram, WhatsApp, and Discord.
+- Add dedupe beyond exact `job_source_url` conflicts.
+- Add scam/domain reputation checks.
+- Add structured logs, metrics, queue-depth monitoring, and alerts.
+- Add retry strategy for transient AI/database failures.
+- Add graceful shutdown handling.
+- Build a reviewer UI or dashboard for `provio_jobs_review`.
+- Choose a specific reliable OpenRouter `:free` model if `openrouter/free` proves too variable.
+- Move production secrets to a secret manager and rotate any exposed local tokens.
+
+## Security Notes
+
+- Never commit `.env`, session files, QR/auth state, database passwords, or API keys.
+- Treat every social message as hostile input.
+- Do not give AI models database, shell, browser, or file-system tools.
+- Keep the model as a parser only; final policy decisions must remain in code.
+- Use `ALLOW_UNSIGNED_LOCAL_JOBS=false` in production.
+- Rotate credentials if they were pasted into chat, screenshots, logs, or commits.
+
+## Useful Commands
+
+Show queue lengths:
 
 ```powershell
-cd "C:\Users\avihs\Desktop\Work 5\DSIE\externaltracker-python"
-npm install
-```
-
-Node dependencies include:
-
-```txt
-discord.js
-redis
-dotenv
-@whiskeysockets/baileys
-qrcode-terminal
-```
-
-### Go
-
-```powershell
-cd "C:\Users\avihs\Desktop\Work 5\DSIE\externaltracker-python\ingest"
-go mod tidy
-go test -buildvcs=false .
-```
-
-### Redis
-
-Expected local container name:
-
-```txt
-provio-redis
-```
-
-Useful checks:
-
-```powershell
-docker ps
-docker start provio-redis
-docker exec provio-redis redis-cli ping
 docker exec provio-redis redis-cli LLEN provio_raw_messages_queue
 docker exec provio-redis redis-cli LLEN provio_clean_jobs_staging
+docker exec provio-redis redis-cli LLEN provio_jobs_review
+docker exec provio-redis redis-cli LLEN provio_jobs_dead_letter
 ```
 
-### PostgreSQL
-
-Expected local database:
-
-```txt
-tracker_db
-```
-
-Useful check:
+Clear local test queues only:
 
 ```powershell
-& "C:\Program Files\PostgreSQL\18\bin\psql.exe" -U postgres -d tracker_db -c "SELECT id, title, company_slug, job_source_url, tech_track, source FROM social_jobs;"
+docker exec provio-redis redis-cli DEL provio_raw_messages_queue
+docker exec provio-redis redis-cli DEL provio_clean_jobs_staging
+docker exec provio-redis redis-cli DEL provio_jobs_review
+docker exec provio-redis redis-cli DEL provio_jobs_dead_letter
 ```
 
-## Required Environment Variables
-
-Create a local `.env` file inside `externaltracker-python`. Do not commit it.
-
-Use placeholders like this:
-
-```env
-REDIS_HOST=127.0.0.1
-REDIS_PORT=6379
-REDIS_URL=redis://localhost:6379/0
-
-PROVIO_RAW_MESSAGES_QUEUE=provio_raw_messages_queue
-PROVIO_CLEAN_JOBS_QUEUE=provio_clean_jobs_staging
-
-TG_API_ID=
-TG_API_HASH=
-TG_SESSION_NAME=provio_tg_session
-TG_PHONE_NUMBER=
-TG_TARGET_CHANNELS=@india_tech_jobs,@fresher_openings_india,@dev_jobs_hub,@offcampusjobupdateslive
-TG_PUBLIC_PREVIEW_CHANNELS=india_tech_jobs,fresher_openings_india,dev_jobs_hub,offcampusjobupdateslive
-TG_WORKER_MODE=telethon
-PUBLIC_PREVIEW_POLL_SECONDS=60
-
-DISCORD_BOT_TOKEN=
-DISCORD_TARGET_CHANNEL_IDS=
-
-WHATSAPP_SESSION_PATH=./wa_session
-
-DATABASE_URL=postgres://postgres:<password>@127.0.0.1:5432/tracker_db
-PROVIO_INGEST_HMAC_SECRET=provio_local_secret_123
-ALLOW_UNSIGNED_LOCAL_JOBS=true
-GO_INGEST_BATCH_SIZE=1
-```
-
-Before production:
-
-```env
-ALLOW_UNSIGNED_LOCAL_JOBS=false
-GO_INGEST_BATCH_SIZE=50
-```
-
-## Running Workers
-
-Run each worker from:
+Run Python syntax check:
 
 ```powershell
 cd "C:\Users\avihs\Desktop\Work 5\DSIE\externaltracker-python"
+python -m py_compile workers\openclaw_worker.py workers\tg_worker.py
 ```
 
-Telegram:
-
-```powershell
-python workers\tg_worker.py
-```
-
-Discord:
-
-```powershell
-node workers\discord_worker.js
-```
-
-WhatsApp:
-
-```powershell
-node workers\wa_worker.js
-```
-
-Go ingestion:
+Run Go build/test:
 
 ```powershell
 cd "C:\Users\avihs\Desktop\Work 5\DSIE\externaltracker-python\ingest"
-go run -buildvcs=false go_ingest.go
+go test -buildvcs=false .
 ```
-
-## Manual End-to-End Test
-
-Until OpenClaw is implemented, manually push a clean job into Redis:
-
-```powershell
-docker exec provio-redis redis-cli RPUSH provio_clean_jobs_staging "{\"title\":\"Data Science Intern\",\"company_slug\":\"Provio Social Test\",\"job_source_url\":\"https://example.com/apply-data-science\",\"raw_description\":\"Hiring fresher data science intern in India\",\"raw_location_text\":\"Remote, India\",\"posted_timestamp\":\"2026-07-03T12:30:00Z\",\"tech_track\":\"data_science\",\"source\":\"manual_clean_test\"}"
-```
-
-Then run the Go ingestion worker. Expected output:
-
-```txt
-[GO-CORE] Connected to Redis.
-[GO-CORE] Connected to PostgreSQL.
-[GO-CORE] Ingestion Funnel active. BATCH_SIZE=1
-[GO-CORE] ALLOW_UNSIGNED_LOCAL_JOBS=true
-[GO-CORE] Queued clean job: Data Science Intern @ Provio Social Test
-[DB-SUCCESS] Inserted/ignored batch of 1 jobs into social_jobs.
-```
-
-Verify in PostgreSQL:
-
-```powershell
-& "C:\Program Files\PostgreSQL\18\bin\psql.exe" -U postgres -d tracker_db -c "SELECT id, title, company_slug, job_source_url, tech_track, source FROM social_jobs;"
-```
-
-## Main Remaining Work
-
-### 1. Build OpenClaw Worker
-
-This is the most important missing component.
-
-Needed:
-
-- `BLPOP provio_raw_messages_queue`
-- Parse raw social messages
-- Classify job vs non-job
-- Filter India-only roles
-- Filter fresher/entry-level roles
-- Filter tech tracks
-- Normalize into `ValidatedJobPayload`
-- Sign with HMAC
-- `RPUSH provio_clean_jobs_staging`
-- Log accepted and rejected messages with reasons
-
-### 2. Verify Live Listener Capture
-
-Each listener has code, but live capture should be proven with fresh messages:
-
-- Telegram: fresh channel post increases `provio_raw_messages_queue`
-- Discord: bot receives a channel message and queue increases
-- WhatsApp: fresh incoming message increases queue
-
-### 3. Add Migrations
-
-The PostgreSQL table was created manually. Add versioned SQL migrations such as:
-
-```txt
-migrations/001_create_social_jobs.sql
-```
-
-### 4. Add Tests
-
-Useful test targets:
-
-- Telegram payload shape
-- Discord payload shape
-- WhatsApp payload shape
-- OpenClaw decision rules
-- HMAC verification
-- Go parser direct payload and envelope payload
-- Go duplicate URL behavior
-- DB transaction rollback/rebuffering
-
-### 5. Improve Operations
-
-Needed before production:
-
-- Structured logs
-- Worker health checks
-- Queue depth monitoring
-- Dead-letter queues
-- Retry strategy
-- Graceful shutdown for all workers
-- Docker Compose for Redis, workers, and local Postgres
-- Deployment notes
-
-### 6. Security Cleanup
-
-Before sharing or deploying:
-
-- Rotate any credentials that were ever pasted into local `.env` or terminal logs
-- Keep `.env`, session files, and QR/auth data out of Git
-- Move production secrets into a secret manager
-- Disable `ALLOW_UNSIGNED_LOCAL_JOBS`
-- Require HMAC signatures from OpenClaw to Go ingestion
-
-## Current Bottom Line
-
-We have built the DSIE foundation: listeners, Redis queue contracts, WhatsApp/Telegram login flows, Discord worker structure, PostgreSQL table, and a real Go-to-Postgres insertion path.
-
-The remaining major gap is the OpenClaw AI decision layer. Once that worker exists, the project can run the real pipeline:
-
-```txt
-Telegram/WhatsApp/Discord
--> provio_raw_messages_queue
--> OpenClaw filtering and normalization
--> provio_clean_jobs_staging
--> Go ingestion
--> PostgreSQL social_jobs
-```
-
-That is the next milestone.
